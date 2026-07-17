@@ -26,7 +26,7 @@ public static class MusicUtils
             }
         }
 
-        if (name.Count == 0)
+        if (string.IsNullOrWhiteSpace(string.Join(" / ", name)))
         {
             return "未知歌手";
         }
@@ -41,9 +41,17 @@ public static class MusicUtils
             if (obj.ContainsKey("album"))
             {
                 cover = (string)obj["album"]["artist"]["img1v1url"];
+                if (string.IsNullOrWhiteSpace((string)obj["album"]["name"]))
+                {
+                    return "未知专辑";
+                }
                 return (string)obj["album"]["name"];
             }
             cover = (string)obj["al"]["picUrl"];
+            if (string.IsNullOrWhiteSpace((string)obj["al"]["name"]))
+            {
+                return "未知专辑";
+            }
             return (string)obj["al"]["name"];
         }
 
