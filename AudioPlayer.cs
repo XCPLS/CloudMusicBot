@@ -33,10 +33,12 @@ public static class AudioPlayer
             if (PlayList.Count != 0 && Program.MusicChannel != null)
             {
                 _exitTimer = 0;
-                _cancellation = new CancellationTokenSource();
                 
                 PlayingMusic = PlayList[0];
                 PlayList.RemoveAt(0);
+
+                _cancellation = new CancellationTokenSource();
+                
                 try
                 {
                     if (audioClient == null || audioClient.ConnectionState != ConnectionState.Connected)
@@ -65,6 +67,7 @@ public static class AudioPlayer
                     }
 
                     var music = await HttpClient.GetAsyncWithTimestamp((string)data["url"], PlayingMusic.Owner);
+                    music.EnsureSuccessStatusCode();
                     var file = File.Create($"{PlayingMusic.Id}");
                     await (await music.Content.ReadAsStreamAsync()).CopyToAsync(file, _cancellation.Token);
                     file.Close();
@@ -100,8 +103,7 @@ public static class AudioPlayer
                 }
                 catch (OperationCanceledException)
                 {
-                    _ffmpeg.Kill(true);
-                    
+                    _ffmpeg?.Kill(true);
                 }
                 catch (Exception e)
                 {
@@ -146,6 +148,6 @@ public static class AudioPlayer
     {
         PlayList.Clear();
         _cancellation?.Cancel();
-        _exitTimer = 299;
+        _ = Program.MusicChannel.DisconnectAsync();
     }
 }
