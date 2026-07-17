@@ -14,11 +14,8 @@ public static class AudioPlayer
     
     private static CancellationTokenSource? _cancellation;
     private static Process? _ffmpeg;
-    
-    private static readonly HttpClient HttpClient = new HttpClient()
-    {
-        Timeout = TimeSpan.FromSeconds(10)
-    };
+
+    private static readonly HttpClient HttpClient = new HttpClient();
 
     private static int _exitTimer = 0;
 

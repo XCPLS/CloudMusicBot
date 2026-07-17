@@ -7,10 +7,7 @@ namespace CloudMusicBot.Modules;
 [Group("user", "用户操作")]
 public class UserCommandModule : InteractionModuleBase<SocketInteractionContext>
 {
-    private static readonly HttpClient HttpClient = new HttpClient()
-    {
-        Timeout = TimeSpan.FromSeconds(10)
-    };
+    private static readonly HttpClient HttpClient = new HttpClient();
     
     [SlashCommand("search", "搜索歌曲")]
     public async Task SearchAsync([Summary("keyword", "关键字")] string keyword)
@@ -84,7 +81,7 @@ public class UserCommandModule : InteractionModuleBase<SocketInteractionContext>
         if ((int)data["data"]["code"] == 200)
         {
             ulong id = (ulong)data["data"]["account"]["id"];
-            response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/user/playlist?uid={id}&limit=100", Context.User.Id);
+            response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/user/playlist?uid={id}", Context.User.Id);
             data = JObject.Parse(await response.Content.ReadAsStringAsync());
             if ((int)data["code"] == 200)
             {

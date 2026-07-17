@@ -1,4 +1,6 @@
-﻿namespace CloudMusicBot;
+﻿using Discord;
+
+namespace CloudMusicBot;
 
 public static class HttpClientExtensions
 {
@@ -21,7 +23,7 @@ public static class HttpClientExtensions
             }
             request.Headers.Add("Cookie", $"MUSIC_U={cookie}");
         }
-
+ 
         return await client.SendAsync(request);
     }
 }

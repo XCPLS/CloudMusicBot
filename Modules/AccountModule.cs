@@ -6,10 +6,7 @@ namespace CloudMusicBot.Modules;
 
 public class AccountModule : InteractionModuleBase<SocketInteractionContext>
 {
-    private static readonly HttpClient HttpClient = new HttpClient()
-    {
-        Timeout = TimeSpan.FromSeconds(10)
-    };
+    private static readonly HttpClient HttpClient = new HttpClient();
     
     [ModalInteraction("account_modal")]
     public async Task HandleCaptchaModalAsync(AccountModal modal)

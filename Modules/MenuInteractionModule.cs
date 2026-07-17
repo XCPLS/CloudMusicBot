@@ -1,4 +1,5 @@
-﻿using Discord;
+﻿using System.Net;
+using Discord;
 using Discord.Interactions;
 using Newtonsoft.Json.Linq;
 
@@ -8,7 +9,7 @@ public class MenuInteractionModule : InteractionModuleBase<SocketInteractionCont
 {
     private static readonly HttpClient HttpClient = new HttpClient()
     {
-        Timeout = TimeSpan.FromSeconds(10)
+        Timeout = TimeSpan.FromSeconds(30)
     };
     
     [ComponentInteraction("menu_previous")]
@@ -140,7 +141,23 @@ public class MenuInteractionModule : InteractionModuleBase<SocketInteractionCont
             return;
         }
         menu.Close();
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/user/playlist?uid={selectedValue}&limit=100", Context.User.Id);
+        
+        await ModifyOriginalResponseAsync(x =>
+        {
+            x.Content = "**加载中...**";
+            x.Components = null;
+        });
+        
+        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/user/playlist?uid={selectedValue}", Context.User.Id);
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            await ModifyOriginalResponseAsync(x =>
+            {
+                x.Content = $"**❌获取数据失败({response.StatusCode})**";
+                x.Components = null;
+            });
+            return;
+        }
         JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
         if ((int)data["code"] == 200)
         {
@@ -157,15 +174,35 @@ public class MenuInteractionModule : InteractionModuleBase<SocketInteractionCont
             }
             
             List<SelectMenuOptionBuilder> options = new List<SelectMenuOptionBuilder>();
+
+            int error = 0;
+            
             foreach (var token in array)
             {
-                options.Add(new SelectMenuOptionBuilder((string)token["name"], (string)token["id"]));
+                try
+                {
+                    options.Add(new SelectMenuOptionBuilder((string)token["name"], (string)token["id"]));
+                }
+                catch
+                {
+                    error++;
+                }
+                
             }
             
             menu = new Menu("playlist", options, "歌单列表", false, Context.User);
             await ModifyOriginalResponseAsync(x =>
             {
+                x.Content = error == 0 ? null : $"**⚠ {error} 个歌单加载失败**";
                 x.Components = menu.GetCurrentPage();
+            });
+        }
+        else
+        {
+            await ModifyOriginalResponseAsync(x =>
+            {
+                x.Content = $"**❌获取数据失败({data["code"]})**";
+                x.Components = null;
             });
         }
     }
@@ -184,22 +221,55 @@ public class MenuInteractionModule : InteractionModuleBase<SocketInteractionCont
             return;
         }
         menu.Close();
+        await ModifyOriginalResponseAsync(x =>
+        {
+            x.Content = "**加载中...**";
+            x.Components = null;
+        });
         var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/playlist/track/all?id={selectedValue}", Context.User.Id);
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            await ModifyOriginalResponseAsync(x =>
+            {
+                x.Content = $"**❌获取数据失败({response.StatusCode})**";
+                x.Components = null;
+            });
+            return;
+        }
         JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
         if ((int)data["code"] == 200)
         {
             JArray array = (JArray)data["songs"];
             List<SelectMenuOptionBuilder> options = new List<SelectMenuOptionBuilder>();
+
+            int error = 0;
             
             foreach (var token in array)
             {
-                options.Add(new SelectMenuOptionBuilder($"{token["name"]} - {MusicUtils.GetArtists(token)}", (string)token["id"], $"《{MusicUtils.GetAlbum(token, out _)}》"));
+                try
+                {
+                    options.Add(new SelectMenuOptionBuilder($"{token["name"]} - {MusicUtils.GetArtists(token)}",
+                        (string)token["id"], $"《{MusicUtils.GetAlbum(token, out _)}》"));
+                }
+                catch
+                {
+                    error++;
+                }
             }
             
             menu = new Menu("music", options, "歌曲列表", true, Context.User);
             await ModifyOriginalResponseAsync(x =>
             {
+                x.Content = error == 0 ? null : $"**⚠ {error} 首歌曲加载失败**";
                 x.Components = menu.GetCurrentPage();
+            });
+        }
+        else
+        {
+            await ModifyOriginalResponseAsync(x =>
+            {
+                x.Content = $"**❌获取数据失败({data["code"]})**";
+                x.Components = null;
             });
         }
     }

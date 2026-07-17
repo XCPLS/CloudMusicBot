@@ -1,4 +1,5 @@
-﻿using Newtonsoft.Json.Linq;
+﻿using Discord;
+using Newtonsoft.Json.Linq;
 
 namespace CloudMusicBot;
 
@@ -42,11 +43,8 @@ public static class MusicUtils
                 cover = (string)obj["album"]["artist"]["img1v1url"];
                 return (string)obj["album"]["name"];
             }
-            else
-            {
-                cover = (string)obj["al"]["picUrl"];
-                return (string)obj["al"]["name"];
-            }
+            cover = (string)obj["al"]["picUrl"];
+            return (string)obj["al"]["name"];
         }
 
         cover = "";

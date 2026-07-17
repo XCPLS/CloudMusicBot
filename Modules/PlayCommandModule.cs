@@ -10,10 +10,7 @@ namespace CloudMusicBot.Modules;
 [Group("play", "播放音乐")]
 public class PlayCommandModule : InteractionModuleBase<SocketInteractionContext>
 {
-    private static readonly HttpClient HttpClient = new HttpClient()
-    {
-        Timeout = TimeSpan.FromSeconds(10)
-    };
+    private static readonly HttpClient HttpClient = new HttpClient();
     
     [SlashCommand("search", "搜索歌曲")]
     public async Task SearchAsync([Summary("keyword", "关键字")] string keyword)

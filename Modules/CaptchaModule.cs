@@ -7,10 +7,7 @@ namespace CloudMusicBot.Modules;
 
 public class CaptchaModule : InteractionModuleBase<SocketInteractionContext>
 {
-    private static readonly HttpClient HttpClient = new HttpClient()
-    {
-        Timeout = TimeSpan.FromSeconds(10)
-    };
+    private static readonly HttpClient HttpClient = new HttpClient();
     
     internal static readonly Dictionary<ulong, ulong> Phone = new Dictionary<ulong, ulong>();
     

@@ -10,10 +10,7 @@ namespace CloudMusicBot.Modules;
 [Group("login", "登录网易云账号")]
 public class LoginCommandModule : InteractionModuleBase<SocketInteractionContext>
 {
-    private static readonly HttpClient HttpClient = new HttpClient()
-    {
-        Timeout = TimeSpan.FromSeconds(10)
-    };
+    private static readonly HttpClient HttpClient = new HttpClient();
     private static readonly Dictionary<ulong, string> QrKey = new Dictionary<ulong, string>();
     
     [SlashCommand("qr", "二维码登录")]
