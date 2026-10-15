@@ -19,9 +19,10 @@ public sealed class AudioPlayer : IAsyncDisposable
     private static readonly TimeSpan VoiceConnectTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan VoiceDisconnectTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan StreamWatchInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan StatusUpdateTimeout = TimeSpan.FromSeconds(10);
 
-    /// <summary>Streams per song, including the first one; the rest are reconnects.</summary>
-    private const int MaxStreamAttempts = 3;
+    /// <summary>Attempts per song, counting the first one; the rest are retries.</summary>
+    private const int MaxAttempts = 3;
 
     private readonly Bot _bot;
     private readonly MusicApi _api;
@@ -37,6 +38,9 @@ public sealed class AudioPlayer : IAsyncDisposable
 
     /// <summary>Set by the Disconnected callback, cleared when a fresh client is built.</summary>
     private volatile bool _voiceLost;
+
+    /// <summary>Last status asked for, so an identical update is never sent twice.</summary>
+    private volatile string _channelStatus = DefaultChannelStatus;
 
     // Read from gateway threads (queue/skip) while the worker writes them.
     private volatile Music? _current;
@@ -235,15 +239,23 @@ public sealed class AudioPlayer : IAsyncDisposable
         _currentPlay = play;
         _current = music;
 
+        string? audioFile = null;
         try
         {
-            // Resolving the url stays outside the retry loop: a song that cannot be
-            // played at all will not become playable just because we reconnected.
+            // Resolving the url stays outside the retry loops: a song that cannot be
+            // played at all will not become playable by trying again.
             var streamUrl = await _api.GetSongStreamUrlAsync(music.Id, music.Owner, play.Token);
-            await SendToVoiceChannelAsync(embed: Embeds.NowPlaying(music));
-            await SetChannelStatusAsync($"正在听 {music.Title}");
 
-            await StreamWithReconnectAsync(streamUrl, play.Token);
+            // The whole song is buffered locally before playback starts. Handing ffmpeg
+            // the network stream directly makes it stall every time the connection
+            // hiccups, which is audible as stuttering, and containers that need to seek
+            // (m4a/mp4) cannot be probed from a pipe at all.
+            audioFile = await DownloadAsync(streamUrl, play.Token);
+
+            await SendToVoiceChannelAsync(embed: Embeds.NowPlaying(music));
+            RequestChannelStatus($"正在听 {music.Title}");
+
+            await StreamWithReconnectAsync(audioFile, play.Token);
         }
         catch (OperationCanceledException)
         {
@@ -258,7 +270,102 @@ public sealed class AudioPlayer : IAsyncDisposable
         {
             _current = null;
             _currentPlay = null;
-            await SetChannelStatusAsync(DefaultChannelStatus);
+            DeleteAudioFile(audioFile);
+        }
+    }
+
+    /// <summary>
+    /// Downloads the song to a temp file. Retried on its own: a download that dies
+    /// halfway has nothing to do with the voice connection.
+    /// </summary>
+    private async Task<string> DownloadAsync(string streamUrl, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await DownloadOnceAsync(streamUrl, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception e) when (attempt < MaxAttempts && e is not BotApiException)
+            {
+                BotLog.Warn($"音频下载中断({e.Message})，正在重试，第 {attempt}/{MaxAttempts - 1} 次");
+                await Task.Delay(RetryDelay, ct);
+            }
+        }
+    }
+
+    private async Task<string> DownloadOnceAsync(string streamUrl, CancellationToken ct)
+    {
+        using var response = await _api.OpenStreamAsync(streamUrl, ct);
+        var path = BuildAudioPath(response, streamUrl);
+        try
+        {
+            await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1 << 16))
+            await using (var source = await response.Content.ReadAsStreamAsync(ct))
+            {
+                await source.CopyToAsync(file, ct);
+            }
+
+            var actual = new FileInfo(path).Length;
+            if (actual == 0)
+            {
+                throw new IOException("音频下载为空");
+            }
+
+            // A truncated body plays as a song that ends early, so treat it as a failure.
+            if (response.Content.Headers.ContentLength is > 0 and var expected && actual < expected)
+            {
+                throw new IOException($"音频下载不完整({actual}/{expected})");
+            }
+
+            return path;
+        }
+        catch
+        {
+            DeleteAudioFile(path);
+            throw;
+        }
+    }
+
+    /// <summary>Temp file with an extension taken from the response, so ffmpeg probes less.</summary>
+    private static string BuildAudioPath(HttpResponseMessage response, string streamUrl)
+    {
+        var extension = response.Content.Headers.ContentType?.MediaType?.ToLowerInvariant() switch
+        {
+            "audio/mpeg" or "audio/mp3" => ".mp3",
+            "audio/mp4" or "audio/m4a" or "audio/x-m4a" or "audio/aac" => ".m4a",
+            "audio/flac" or "audio/x-flac" => ".flac",
+            "audio/wav" or "audio/x-wav" => ".wav",
+            "audio/ogg" => ".ogg",
+            _ => Path.GetExtension(Uri.TryCreate(streamUrl, UriKind.Absolute, out var uri) ? uri.AbsolutePath : "")
+        };
+
+        if (extension.Length is <= 1 or > 6 || !extension[1..].All(char.IsLetterOrDigit))
+        {
+            extension = ".mp3";
+        }
+
+        return Path.Combine(Path.GetTempPath(), $"cloudmusic-{Guid.NewGuid():N}{extension}");
+    }
+
+    private static void DeleteAudioFile(string? path)
+    {
+        if (path is null)
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception e)
+        {
+            BotLog.Warn($"删除音频缓存失败({path}): {e.Message}");
         }
     }
 
@@ -266,30 +373,30 @@ public sealed class AudioPlayer : IAsyncDisposable
     /// Streams the song, rebuilding the voice connection when it drops instead of
     /// abandoning the song. Only the current song is retried, and only a few times.
     /// </summary>
-    private async Task StreamWithReconnectAsync(string streamUrl, CancellationToken ct)
+    private async Task StreamWithReconnectAsync(string audioPath, CancellationToken ct)
     {
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                await StreamOnceAsync(streamUrl, ct);
+                await StreamOnceAsync(audioPath, ct);
                 return;
             }
             catch (OperationCanceledException)
             {
                 throw;
             }
-            catch (Exception e) when (attempt < MaxStreamAttempts && e is not BotApiException)
+            catch (Exception e) when (attempt < MaxAttempts && e is not BotApiException)
             {
                 BotLog.Warn($"播放中断({e.Message})，{RetryDelay.TotalSeconds:0} 秒后重连，" +
-                            $"第 {attempt}/{MaxStreamAttempts - 1} 次");
+                            $"第 {attempt}/{MaxAttempts - 1} 次");
                 await DisconnectVoiceAsync();
                 await Task.Delay(RetryDelay, ct);
             }
         }
     }
 
-    private async Task StreamOnceAsync(string streamUrl, CancellationToken ct)
+    private async Task StreamOnceAsync(string audioPath, CancellationToken ct)
     {
         if (_bot.VoiceChannel is not { } channel)
         {
@@ -297,25 +404,22 @@ public sealed class AudioPlayer : IAsyncDisposable
         }
 
         var voice = await EnsureVoiceAsync(channel);
-        using var response = await _api.OpenStreamAsync(streamUrl, ct);
         ct.ThrowIfCancellationRequested();
 
-        var ffmpeg = StartFfmpeg();
-
-        // Declared outside the try below so it is disposed *after* ffmpeg is stopped;
-        // a live ffmpeg writing into a disposed pcm stream is what used to hang playback.
+        // The pcm stream comes first: if the connection dies right here, no ffmpeg
+        // process is left running behind us.
         await using var pcm = voice.CreatePCMStream(AudioApplication.Music);
+        var ffmpeg = StartFfmpeg(audioPath);
         try
         {
-            await using var source = await response.Content.ReadAsStreamAsync(ct);
             using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
-
-            var feed = FeedAsync(source, ffmpeg.StandardInput.BaseStream, lifetime.Token);
-            var pump = PumpAsync(ffmpeg.StandardOutput.BaseStream, pcm, lifetime, lifetime.Token);
-            await WaitForStreamAsync(Task.WhenAll(feed, pump), lifetime, ct);
+            var pump = ffmpeg.StandardOutput.BaseStream.CopyToAsync(pcm, lifetime.Token);
+            await WaitForStreamAsync(pump, lifetime, ct);
         }
         finally
         {
+            // ffmpeg has to be gone before the pcm stream is disposed below; a live
+            // ffmpeg writing into a disposed stream is what used to hang playback.
             await StopFfmpegAsync(ffmpeg);
         }
     }
@@ -346,56 +450,14 @@ public sealed class AudioPlayer : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Copies ffmpeg output into the voice stream. Anything failing here means the
-    /// connection went away, so feeding is stopped and the error is left to
-    /// <see cref="StreamWithReconnectAsync"/>.
-    /// </summary>
-    private static async Task PumpAsync(Stream source, Stream destination, CancellationTokenSource lifetime, CancellationToken ct)
-    {
-        try
-        {
-            await source.CopyToAsync(destination, ct);
-        }
-        finally
-        {
-            // Cancelling the child source leaves the parent token alone.
-            await lifetime.CancelAsync();
-        }
-    }
-
-    /// <summary>Streams the http body into ffmpeg, then closes its input to signal the end of the song.</summary>
-    private static async Task FeedAsync(Stream source, Stream destination, CancellationToken ct)
-    {
-        try
-        {
-            await source.CopyToAsync(destination, ct);
-            await destination.FlushAsync(ct);
-        }
-        catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException)
-        {
-            // ffmpeg is gone; nothing left to feed.
-        }
-        finally
-        {
-            try
-            {
-                destination.Close();
-            }
-            catch (Exception)
-            {
-                // Already closed.
-            }
-        }
-    }
-
-    private Process StartFfmpeg()
+    private Process StartFfmpeg(string audioPath)
     {
         var startInfo = new ProcessStartInfo
         {
             FileName = _bot.Config.FfmpegPath,
-            Arguments = "-hide_banner -loglevel error -i pipe:0 -vn -acodec pcm_s16le -f s16le -ar 48000 -ac 2 pipe:1",
-            RedirectStandardInput = true,
+            // -nostdin keeps ffmpeg from treating our console as an interaction terminal.
+            Arguments = $"-hide_banner -loglevel error -nostdin -i \"{audioPath}\" -vn " +
+                        "-acodec pcm_s16le -f s16le -ar 48000 -ac 2 pipe:1",
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -516,16 +578,33 @@ public sealed class AudioPlayer : IAsyncDisposable
             voice.Dispose();
         }
 
-        await SetChannelStatusAsync(DefaultChannelStatus);
+        RequestChannelStatus(DefaultChannelStatus);
     }
 
-    private async Task SetChannelStatusAsync(string status)
+    /// <summary>
+    /// The channel status is cosmetic, so it never runs on the playback path. Discord
+    /// rate limits channel edits hard, and awaiting that call used to stall the queue
+    /// for minutes once the limit was hit.
+    /// </summary>
+    private void RequestChannelStatus(string status)
+    {
+        if (_channelStatus == status)
+        {
+            return;
+        }
+
+        _channelStatus = status;
+        _ = ApplyChannelStatusAsync(status);
+    }
+
+    private async Task ApplyChannelStatusAsync(string status)
     {
         try
         {
             if (_bot.VoiceChannel is { } channel)
             {
-                await channel.SetStatusAsync(status);
+                using var timeout = new CancellationTokenSource(StatusUpdateTimeout);
+                await channel.SetStatusAsync(status).WaitAsync(timeout.Token);
             }
         }
         catch (Exception e)

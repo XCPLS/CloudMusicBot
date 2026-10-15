@@ -1,6 +1,8 @@
 using System.Reflection;
 using Discord;
 using Discord.Interactions;
+using Discord.LibDave;
+using Discord.LibDave.Binding;
 using Discord.WebSocket;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -28,6 +30,8 @@ public sealed class Bot : IAsyncDisposable
         Api = new MusicApi(config, Sessions);
         Menus = new MenuManager();
         Player = new AudioPlayer(this);
+
+        SilenceDaveLogs();
 
         _client = new DiscordSocketClient(new DiscordSocketConfig
         {
@@ -167,6 +171,36 @@ public sealed class Bot : IAsyncDisposable
         catch (Exception e)
         {
             BotLog.Error($"回复错误提示失败: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// libdave prints one line per encrypted frame by default, straight to the console.
+    /// That logging sits on the audio send path, and a growing console buffer makes each
+    /// write slower, which shows up as playback stuttering that gets worse over time.
+    /// Only real errors are kept.
+    /// </summary>
+    private static void SilenceDaveLogs()
+    {
+        if (!Dave.CheckAvailability())
+        {
+            // Nothing to silence; the native library is not loaded at all.
+            return;
+        }
+
+        try
+        {
+            Dave.SetLogSink((severity, file, line, message) =>
+            {
+                if (severity >= LoggingSeverity.Error)
+                {
+                    BotLog.Error($"libdave: {message} ({Path.GetFileName(file)}:{line})");
+                }
+            });
+        }
+        catch (Exception e)
+        {
+            BotLog.Warn($"无法接管 libdave 日志: {e.Message}");
         }
     }
 
