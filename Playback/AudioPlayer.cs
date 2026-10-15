@@ -15,6 +15,13 @@ public sealed class AudioPlayer : IAsyncDisposable
 
     private static readonly TimeSpan IdleDisconnectDelay = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan FfmpegArgumentWait = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan VoiceConnectTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan VoiceDisconnectTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan StreamWatchInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>Streams per song, including the first one; the rest are reconnects.</summary>
+    private const int MaxStreamAttempts = 3;
 
     private readonly Bot _bot;
     private readonly MusicApi _api;
@@ -24,7 +31,12 @@ public sealed class AudioPlayer : IAsyncDisposable
     private readonly CancellationTokenSource _shutdown = new();
 
     private Task? _worker;
-    private IAudioClient? _voice;
+
+    // Written by the worker, read by the Disconnected callback on a gateway thread.
+    private volatile IAudioClient? _voice;
+
+    /// <summary>Set by the Disconnected callback, cleared when a fresh client is built.</summary>
+    private volatile bool _voiceLost;
 
     // Read from gateway threads (queue/skip) while the worker writes them.
     private volatile Music? _current;
@@ -223,42 +235,15 @@ public sealed class AudioPlayer : IAsyncDisposable
         _currentPlay = play;
         _current = music;
 
-        Process? ffmpeg = null;
         try
         {
-            if (_bot.VoiceChannel is not { } channel)
-            {
-                throw new BotApiException("语音频道不可用");
-            }
-
-            var voice = await EnsureVoiceAsync(channel);
+            // Resolving the url stays outside the retry loop: a song that cannot be
+            // played at all will not become playable just because we reconnected.
             var streamUrl = await _api.GetSongStreamUrlAsync(music.Id, music.Owner, play.Token);
-            using var response = await _api.OpenStreamAsync(streamUrl, play.Token);
-            play.Token.ThrowIfCancellationRequested();
-
             await SendToVoiceChannelAsync(embed: Embeds.NowPlaying(music));
             await SetChannelStatusAsync($"正在听 {music.Title}");
 
-            ffmpeg = StartFfmpeg();
-            await using var pcm = voice.CreatePCMStream(AudioApplication.Music);
-            try
-            {
-                await using var source = await response.Content.ReadAsStreamAsync(play.Token);
-                var feed = FeedAsync(source, ffmpeg.StandardInput.BaseStream, play.Token);
-                var pump = ffmpeg.StandardOutput.BaseStream.CopyToAsync(pcm, play.Token);
-                await Task.WhenAll(feed, pump);
-            }
-            catch (Exception e) when (e is IOException or ObjectDisposedException)
-            {
-                // ffmpeg closed the pipe, usually because the song ended.
-            }
-            finally
-            {
-                // ffmpeg has to be gone before the pcm stream closes, otherwise the
-                // discord stream can block on its own buffer.
-                await StopFfmpegAsync(ffmpeg);
-                ffmpeg = null;
-            }
+            await StreamWithReconnectAsync(streamUrl, play.Token);
         }
         catch (OperationCanceledException)
         {
@@ -271,14 +256,111 @@ public sealed class AudioPlayer : IAsyncDisposable
         }
         finally
         {
-            if (ffmpeg is not null)
-            {
-                await StopFfmpegAsync(ffmpeg);
-            }
-
             _current = null;
             _currentPlay = null;
             await SetChannelStatusAsync(DefaultChannelStatus);
+        }
+    }
+
+    /// <summary>
+    /// Streams the song, rebuilding the voice connection when it drops instead of
+    /// abandoning the song. Only the current song is retried, and only a few times.
+    /// </summary>
+    private async Task StreamWithReconnectAsync(string streamUrl, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await StreamOnceAsync(streamUrl, ct);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception e) when (attempt < MaxStreamAttempts && e is not BotApiException)
+            {
+                BotLog.Warn($"播放中断({e.Message})，{RetryDelay.TotalSeconds:0} 秒后重连，" +
+                            $"第 {attempt}/{MaxStreamAttempts - 1} 次");
+                await DisconnectVoiceAsync();
+                await Task.Delay(RetryDelay, ct);
+            }
+        }
+    }
+
+    private async Task StreamOnceAsync(string streamUrl, CancellationToken ct)
+    {
+        if (_bot.VoiceChannel is not { } channel)
+        {
+            throw new BotApiException("语音频道不可用");
+        }
+
+        var voice = await EnsureVoiceAsync(channel);
+        using var response = await _api.OpenStreamAsync(streamUrl, ct);
+        ct.ThrowIfCancellationRequested();
+
+        var ffmpeg = StartFfmpeg();
+
+        // Declared outside the try below so it is disposed *after* ffmpeg is stopped;
+        // a live ffmpeg writing into a disposed pcm stream is what used to hang playback.
+        await using var pcm = voice.CreatePCMStream(AudioApplication.Music);
+        try
+        {
+            await using var source = await response.Content.ReadAsStreamAsync(ct);
+            using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+            var feed = FeedAsync(source, ffmpeg.StandardInput.BaseStream, lifetime.Token);
+            var pump = PumpAsync(ffmpeg.StandardOutput.BaseStream, pcm, lifetime, lifetime.Token);
+            await WaitForStreamAsync(Task.WhenAll(feed, pump), lifetime, ct);
+        }
+        finally
+        {
+            await StopFfmpegAsync(ffmpeg);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the song to end, bailing out as soon as the voice connection is
+    /// known to be gone: a write into a dropped socket does not reliably fail on its
+    /// own, and the song would otherwise sit there silently consuming the queue.
+    /// </summary>
+    private async Task WaitForStreamAsync(Task streaming, CancellationTokenSource lifetime, CancellationToken ct)
+    {
+        while (true)
+        {
+            if (await Task.WhenAny(streaming, Task.Delay(StreamWatchInterval)) == streaming)
+            {
+                // Surfaces whatever the stream itself failed with.
+                await streaming;
+                return;
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            if (_voiceLost)
+            {
+                await lifetime.CancelAsync();
+                throw new IOException("语音连接已断开");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Copies ffmpeg output into the voice stream. Anything failing here means the
+    /// connection went away, so feeding is stopped and the error is left to
+    /// <see cref="StreamWithReconnectAsync"/>.
+    /// </summary>
+    private static async Task PumpAsync(Stream source, Stream destination, CancellationTokenSource lifetime, CancellationToken ct)
+    {
+        try
+        {
+            await source.CopyToAsync(destination, ct);
+        }
+        finally
+        {
+            // Cancelling the child source leaves the parent token alone.
+            await lifetime.CancelAsync();
         }
     }
 
@@ -371,26 +453,33 @@ public sealed class AudioPlayer : IAsyncDisposable
 
     private async Task<IAudioClient> EnsureVoiceAsync(SocketVoiceChannel channel)
     {
-        if (_voice is { ConnectionState: ConnectionState.Connected } connected)
+        // ConnectionState alone is not enough: it can still read Connected for a
+        // moment after the socket is gone, which is why the callback sets _voiceLost.
+        if (!_voiceLost && _voice is { ConnectionState: ConnectionState.Connected } connected)
         {
             return connected;
         }
 
         await DisconnectVoiceAsync();
 
-        var voice = await channel.ConnectAsync();
-        voice.Disconnected += OnVoiceDisconnected;
+        using var timeout = new CancellationTokenSource(VoiceConnectTimeout);
+        var voice = await channel.ConnectAsync().WaitAsync(timeout.Token);
+        voice.Disconnected += exception => OnVoiceDisconnected(voice, exception);
         _voice = voice;
+        _voiceLost = false;
         return voice;
     }
 
-    private Task OnVoiceDisconnected(Exception? exception)
+    private Task OnVoiceDisconnected(IAudioClient source, Exception? exception)
     {
-        if (exception is not null)
+        // A late callback from a client we already replaced must not mark the new one dead.
+        if (!ReferenceEquals(_voice, source))
         {
-            BotLog.Warn($"语音连接断开: {exception.Message}");
+            return Task.CompletedTask;
         }
 
+        _voiceLost = true;
+        BotLog.Warn(exception is null ? "语音连接已断开" : $"语音连接断开: {exception.Message}");
         return Task.CompletedTask;
     }
 
@@ -403,6 +492,8 @@ public sealed class AudioPlayer : IAsyncDisposable
             _voice = null;
         }
 
+        _voiceLost = false;
+
         if (voice is null)
         {
             return;
@@ -410,14 +501,19 @@ public sealed class AudioPlayer : IAsyncDisposable
 
         try
         {
-            voice.Disconnected -= OnVoiceDisconnected;
-            // StopAsync closes the voice websocket and leaves the channel.
-            await voice.StopAsync();
-            voice.Dispose();
+            // StopAsync closes the voice websocket and leaves the channel. Bounded,
+            // because a client that is already gone can otherwise leave the
+            // playback worker waiting on it forever.
+            using var timeout = new CancellationTokenSource(VoiceDisconnectTimeout);
+            await voice.StopAsync().WaitAsync(timeout.Token);
         }
         catch (Exception e)
         {
             BotLog.Warn($"断开语音连接失败: {e.Message}");
+        }
+        finally
+        {
+            voice.Dispose();
         }
 
         await SetChannelStatusAsync(DefaultChannelStatus);
