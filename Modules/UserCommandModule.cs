@@ -1,101 +1,78 @@
-﻿using Discord;
+using Discord;
 using Discord.Interactions;
-using Newtonsoft.Json.Linq;
 
 namespace CloudMusicBot.Modules;
 
 [Group("user", "用户操作")]
-public class UserCommandModule : InteractionModuleBase<SocketInteractionContext>
+public class UserCommandModule : BotModule
 {
-    private static readonly HttpClient HttpClient = new HttpClient();
-    
-    [SlashCommand("search", "搜索歌曲")]
+    public UserCommandModule(Bot bot) : base(bot)
+    {
+    }
+
+    [SlashCommand("search", "搜索用户")]
     public async Task SearchAsync([Summary("keyword", "关键字")] string keyword)
     {
         await DeferAsync(ephemeral: true);
-        if (Context.Guild == null)
+        if (!await RequireVoiceChannelAsync() || !await RequireLoginAsync() || !await RequireNoOpenMenuAsync())
         {
-            await FollowupAsync($"❌请前往 **{Program.MusicChannel.Guild.Name}** 中执行该指令！");
-            return;
-        }
-        
-        if (!UserCookie.UserCookies.ContainsKey(Context.User.Id))
-        {
-            await FollowupAsync("**❌你需要登录后才能执行该操作！**");
             return;
         }
 
-        if (Menu.TryGetUserCurrentMenu(Context.User, out _))
+        IReadOnlyList<UserSummary> users;
+        try
         {
-            await FollowupAsync("**❌你还有未处理的表单！**");
+            users = await Api.SearchUsersAsync(keyword, Context.User.Id);
+        }
+        catch (BotApiException e)
+        {
+            await FollowupAsync($"**❌搜索失败: {e.Message}**");
             return;
         }
-        
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/search?type=1002&limit=20&keywords={keyword}", Context.User.Id);
-        JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
-        if ((int)data["code"] == 200)
+
+        if (users.Count == 0)
         {
-            JArray array = (JArray)data["result"]["userprofiles"];
-            
-            if (array.Count == 0)
-            {
-                await FollowupAsync("**❌未搜索到用户**");
-                return;
-            }
-            
-            List<SelectMenuOptionBuilder> options = new List<SelectMenuOptionBuilder>();
-            foreach (var token in array)
-            {
-                options.Add(new SelectMenuOptionBuilder((string)token["nickname"], (string)token["userId"]));
-            }
-            
-            var menu = new Menu("user", options, "搜索结果", false, Context.User);
-            await FollowupAsync(components: menu.GetCurrentPage());
+            await FollowupAsync("**❌未搜索到用户**");
+            return;
         }
+
+        var options = users.Select(user => Menu.Option(user.Nickname, user.Id.ToString()));
+        var menu = Bot.Menus.Open(Context.User.Id, "user", "搜索结果", multiSelect: false, options);
+        await FollowupAsync(components: menu.BuildCurrentPage());
     }
-    
+
     [SlashCommand("me", "查看账号歌单")]
     public async Task MeAsync()
     {
         await DeferAsync(ephemeral: true);
-        if (Context.Guild == null)
+        if (!await RequireVoiceChannelAsync() || !await RequireLoginAsync() || !await RequireNoOpenMenuAsync())
         {
-            await FollowupAsync($"❌请前往 **{Program.MusicChannel.Guild.Name}** 中执行该指令！");
-            return;
-        }
-        
-        if (!UserCookie.UserCookies.ContainsKey(Context.User.Id))
-        {
-            await FollowupAsync("**❌你需要登录后才能执行该操作！**");
             return;
         }
 
-        if (Menu.TryGetUserCurrentMenu(Context.User, out _))
+        try
         {
-            await FollowupAsync("**❌你还有未处理的表单！**");
-            return;
-        }
-        
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/login/status", Context.User.Id);
-        JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
-        if ((int)data["data"]["code"] == 200)
-        {
-            ulong id = (ulong)data["data"]["account"]["id"];
-            response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/user/playlist?uid={id}", Context.User.Id);
-            data = JObject.Parse(await response.Content.ReadAsStringAsync());
-            if ((int)data["code"] == 200)
+            var account = await Api.GetAccountAsync(Context.User.Id);
+            if (account is null)
             {
-                JArray array = (JArray)data["playlist"];
-            
-                List<SelectMenuOptionBuilder> options = new List<SelectMenuOptionBuilder>();
-                foreach (var token in array)
-                {
-                    options.Add(new SelectMenuOptionBuilder((string)token["name"], (string)token["id"]));
-                }
-            
-                Menu menu = new Menu("playlist", options, "歌单列表", false, Context.User);
-                await FollowupAsync(components: menu.GetCurrentPage());
+                await FollowupAsync("**❌登录状态已失效，请重新登录！**");
+                return;
             }
+
+            var playlists = await Api.GetUserPlaylistsAsync(account.UserId, Context.User.Id);
+            if (playlists.Count == 0)
+            {
+                await FollowupAsync("**❌未获取到歌单**");
+                return;
+            }
+
+            var options = playlists.Select(playlist => Menu.Option(playlist.Name, playlist.Id.ToString()));
+            var menu = Bot.Menus.Open(Context.User.Id, "playlist", "歌单列表", multiSelect: false, options);
+            await FollowupAsync(components: menu.BuildCurrentPage());
+        }
+        catch (BotApiException e)
+        {
+            await FollowupAsync($"**❌{e.Message}**");
         }
     }
 }

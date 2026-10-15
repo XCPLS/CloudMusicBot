@@ -10,5 +10,5 @@ public class CaptchaModal : IModal
     [Required]
     [InputLabel("验证码")]
     [ModalTextInput("captcha", placeholder: "请输入短信验证码", maxLength: 4)]
-    public string Code { get; set; }
+    public string Code { get; set; } = null!;
 }

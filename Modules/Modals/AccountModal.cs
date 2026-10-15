@@ -10,10 +10,10 @@ public class AccountModal : IModal
     [Required]
     [InputLabel("账号")]
     [ModalTextInput("account", placeholder: "邮箱/手机号")]
-    public string Account { get; set; }
+    public string Account { get; set; } = null!;
     
     [Required]
     [InputLabel("密码")]
     [ModalTextInput("password", placeholder: "密码")]
-    public string Password { get; set; }
+    public string Password { get; set; } = null!;
 }

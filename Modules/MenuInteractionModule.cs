@@ -1,276 +1,208 @@
-﻿using System.Net;
 using Discord;
 using Discord.Interactions;
-using Newtonsoft.Json.Linq;
 
 namespace CloudMusicBot.Modules;
 
-public class MenuInteractionModule : InteractionModuleBase<SocketInteractionContext>
+public class MenuInteractionModule : BotModule
 {
-    private static readonly HttpClient HttpClient = new HttpClient()
+    private const string Expired = "**❌该操作已过期**";
+
+    /// <summary>An edit with this component set removes the buttons from the message.</summary>
+    private static readonly MessageComponent EmptyComponents = new ComponentBuilder().Build();
+
+    public MenuInteractionModule(Bot bot) : base(bot)
     {
-        Timeout = TimeSpan.FromSeconds(30)
-    };
-    
+    }
+
     [ComponentInteraction("menu_previous")]
     public async Task PreviousAsync()
     {
         await DeferAsync(ephemeral: true);
-        if (!Menu.TryGetUserCurrentMenu(Context.User, out var menu))
+        if (!Bot.Menus.TryGet(Context.User.Id, out var menu))
         {
-            await RespondAsync("**❌该操作已过期**", ephemeral: true);
+            await CloseAsync(Expired);
             return;
         }
+
         menu.Previous();
-        await ModifyOriginalResponseAsync(x =>
-        {
-            x.Components = menu.GetCurrentPage();
-        });
+        await ModifyOriginalResponseAsync(message => message.Components = menu.BuildCurrentPage());
     }
-    
+
     [ComponentInteraction("menu_next")]
     public async Task NextAsync()
     {
         await DeferAsync(ephemeral: true);
-        if (!Menu.TryGetUserCurrentMenu(Context.User, out var menu))
+        if (!Bot.Menus.TryGet(Context.User.Id, out var menu))
         {
-            await RespondAsync("**❌该操作已过期**", ephemeral: true);
+            await CloseAsync(Expired);
             return;
         }
+
         menu.Next();
-        await ModifyOriginalResponseAsync(x =>
-        {
-            x.Components = menu.GetCurrentPage();
-        });
+        await ModifyOriginalResponseAsync(message => message.Components = menu.BuildCurrentPage());
     }
-    
+
     [ComponentInteraction("menu_cancel")]
     public async Task CancelAsync()
     {
         await DeferAsync(ephemeral: true);
-        
-        if (!Menu.TryGetUserCurrentMenu(Context.User, out var menu))
+        if (!Bot.Menus.TryGet(Context.User.Id, out _))
         {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = "**❌该操作已过期**";
-                x.Components = null;
-            });
+            await CloseAsync(Expired);
             return;
         }
-        menu.Close();
-        await ModifyOriginalResponseAsync(x =>
-        {
-            x.Content = "**✔该操作已取消**";
-            x.Components = null;
-        });
+
+        Bot.Menus.Close(Context.User.Id);
+        await CloseAsync("**✔该操作已取消**");
     }
-    
+
     [ComponentInteraction("music")]
-    public async Task MusicSelectAsync(string[] selectedValue)
+    public async Task MusicSelectAsync(string[] selectedValues)
     {
         await DeferAsync(ephemeral: true);
-        if (!Menu.TryGetUserCurrentMenu(Context.User, out var menu))
+        if (!Bot.Menus.TryGet(Context.User.Id, out var menu))
         {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = "**❌该操作已过期**";
-                x.Components = null;
-            });
+            await CloseAsync(Expired);
             return;
         }
-        menu.UpdateSelect(selectedValue);
-        await ModifyOriginalResponseAsync(x =>
-        {
-            
-        });
+
+        menu.UpdateSelection(selectedValues);
+        // Re-render so the picks survive a trip to another page and back.
+        await ModifyOriginalResponseAsync(message => message.Components = menu.BuildCurrentPage());
     }
-    
+
     [ComponentInteraction("menu_music_confirm")]
     public async Task MusicConfirmAsync()
     {
         await DeferAsync(ephemeral: true);
-        if (!Menu.TryGetUserCurrentMenu(Context.User, out var menu))
+        if (!Bot.Menus.TryGet(Context.User.Id, out var menu))
         {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = "**❌该操作已过期**";
-                x.Components = null;
-            });
+            await CloseAsync(Expired);
             return;
         }
-        menu.Close();
-        List<Music> select = new List<Music>();
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/song/detail?ids={string.Join(",", menu.GetSelected())}", Context.User.Id);
-        string reply = await response.Content.ReadAsStringAsync();
-        foreach (var song in (JArray)JObject.Parse(reply)["songs"])
+
+        var selected = menu.GetSelected();
+        Bot.Menus.Close(Context.User.Id);
+
+        if (selected.Length == 0)
         {
-            JObject data = (JObject)song;
-            select.Add(new Music()
-            {
-                Id = (ulong) data["id"],
-                Name = (string) data["name"],
-                Artist = MusicUtils.GetArtists(song),
-                Album = MusicUtils.GetAlbum(song, out var cover),
-                Cover = cover,
-                Owner = Context.User.Id
-            });
+            await CloseAsync("**❌你还没有选择歌曲**");
+            return;
         }
-        
-        AudioPlayer.PlayList.AddRange(select);
-        await ModifyOriginalResponseAsync(x =>
+
+        try
         {
-            x.Content = "**✔歌曲提交成功**";
-            x.Components = null;
-        });
-        await Program.MusicChannel.SendMessageAsync($"<@{Context.User.Id}> 点播 {select.Count} 首歌曲: \n```{string.Join("\n", select.Select(music => $"{music.Name} - {music.Artist} 《{music.Album}》"))}```");
-        
+            var songIds = selected.Select(ulong.Parse);
+            var songs = await Api.GetSongsAsync(songIds, Context.User.Id);
+            if (songs.Count == 0)
+            {
+                await CloseAsync("**❌未找到对应歌曲**");
+                return;
+            }
+
+            Bot.Player.EnqueueRange(songs);
+            await CloseAsync("**✔歌曲提交成功**");
+            await Bot.SendToMusicChannelAsync(
+                $"<@{Context.User.Id}> 点播 {songs.Count} 首歌曲: \n```{TextFormat.SongList(songs).TrimStart('\n')}```");
+        }
+        catch (BotApiException e)
+        {
+            await CloseAsync($"**❌{e.Message}**");
+        }
     }
-    
+
     [ComponentInteraction("user")]
     public async Task UserSelectAsync(string selectedValue)
     {
         await DeferAsync(ephemeral: true);
-        if (!Menu.TryGetUserCurrentMenu(Context.User, out var menu))
+        if (!Bot.Menus.TryGet(Context.User.Id, out _))
         {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = "**❌该操作已过期**";
-                x.Components = null;
-            });
+            await CloseAsync(Expired);
             return;
         }
-        menu.Close();
-        
-        await ModifyOriginalResponseAsync(x =>
+
+        Bot.Menus.Close(Context.User.Id);
+        await CloseAsync("**加载中...**");
+
+        if (!ulong.TryParse(selectedValue, out var userId))
         {
-            x.Content = "**加载中...**";
-            x.Components = null;
-        });
-        
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/user/playlist?uid={selectedValue}", Context.User.Id);
-        if (response.StatusCode != HttpStatusCode.OK)
-        {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = $"**❌获取数据失败({response.StatusCode})**";
-                x.Components = null;
-            });
+            await CloseAsync("**❌该操作已过期**");
             return;
         }
-        JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
-        if ((int)data["code"] == 200)
+
+        try
         {
-            JArray array = (JArray)data["playlist"];
-            
-            if (array.Count == 0)
+            var playlists = await Api.GetUserPlaylistsAsync(userId, Context.User.Id);
+            if (playlists.Count == 0)
             {
-                await ModifyOriginalResponseAsync(x =>
-                {
-                    x.Content = "**❌该用户未公开歌单**";
-                    x.Components = null;
-                });
+                await CloseAsync("**❌该用户未公开歌单**");
                 return;
             }
-            
-            List<SelectMenuOptionBuilder> options = new List<SelectMenuOptionBuilder>();
 
-            int error = 0;
-            
-            foreach (var token in array)
-            {
-                try
-                {
-                    options.Add(new SelectMenuOptionBuilder((string)token["name"], (string)token["id"]));
-                }
-                catch
-                {
-                    error++;
-                }
-                
-            }
-            
-            menu = new Menu("playlist", options, "歌单列表", false, Context.User);
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = error == 0 ? null : $"**⚠ {error} 个歌单加载失败**";
-                x.Components = menu.GetCurrentPage();
-            });
+            var options = playlists.Select(playlist => Menu.Option(playlist.Name, playlist.Id.ToString()));
+            await OpenMenuAsync("playlist", "歌单列表", multiSelect: false, options);
         }
-        else
+        catch (BotApiException e)
         {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = $"**❌获取数据失败({data["code"]})**";
-                x.Components = null;
-            });
+            await CloseAsync($"**❌{e.Message}**");
         }
     }
-    
+
     [ComponentInteraction("playlist")]
-    public async Task PlayListSelectAsync(string selectedValue)
+    public async Task PlaylistSelectAsync(string selectedValue)
     {
         await DeferAsync(ephemeral: true);
-        if (!Menu.TryGetUserCurrentMenu(Context.User, out var menu))
+        if (!Bot.Menus.TryGet(Context.User.Id, out _))
         {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = "**❌该操作已过期**";
-                x.Components = null;
-            });
+            await CloseAsync(Expired);
             return;
         }
-        menu.Close();
-        await ModifyOriginalResponseAsync(x =>
-        {
-            x.Content = "**加载中...**";
-            x.Components = null;
-        });
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/playlist/track/all?id={selectedValue}", Context.User.Id);
-        if (response.StatusCode != HttpStatusCode.OK)
-        {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = $"**❌获取数据失败({response.StatusCode})**";
-                x.Components = null;
-            });
-            return;
-        }
-        JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
-        if ((int)data["code"] == 200)
-        {
-            JArray array = (JArray)data["songs"];
-            List<SelectMenuOptionBuilder> options = new List<SelectMenuOptionBuilder>();
 
-            int error = 0;
-            
-            foreach (var token in array)
-            {
-                try
-                {
-                    options.Add(new SelectMenuOptionBuilder($"{token["name"]} - {MusicUtils.GetArtists(token)}",
-                        (string)token["id"], $"《{MusicUtils.GetAlbum(token, out _)}》"));
-                }
-                catch
-                {
-                    error++;
-                }
-            }
-            
-            menu = new Menu("music", options, "歌曲列表", true, Context.User);
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = error == 0 ? null : $"**⚠ {error} 首歌曲加载失败**";
-                x.Components = menu.GetCurrentPage();
-            });
-        }
-        else
+        Bot.Menus.Close(Context.User.Id);
+        await CloseAsync("**加载中...**");
+
+        if (!ulong.TryParse(selectedValue, out var playlistId))
         {
-            await ModifyOriginalResponseAsync(x =>
-            {
-                x.Content = $"**❌获取数据失败({data["code"]})**";
-                x.Components = null;
-            });
+            await CloseAsync("**❌该操作已过期**");
+            return;
         }
+
+        try
+        {
+            var songs = await Api.GetPlaylistTracksAsync(playlistId, Context.User.Id);
+            if (songs.Count == 0)
+            {
+                await CloseAsync("**❌该歌单没有歌曲**");
+                return;
+            }
+
+            var options = songs.Select(song =>
+                Menu.Option(song.Title, song.Id.ToString(), $"《{song.Album}》"));
+            await OpenMenuAsync("music", "歌曲列表", multiSelect: true, options);
+        }
+        catch (BotApiException e)
+        {
+            await CloseAsync($"**❌{e.Message}**");
+        }
+    }
+
+    private async Task OpenMenuAsync(string customId, string placeholder, bool multiSelect, IEnumerable<SelectMenuOptionBuilder> options)
+    {
+        var menu = Bot.Menus.Open(Context.User.Id, customId, placeholder, multiSelect, options);
+        await ModifyOriginalResponseAsync(message =>
+        {
+            message.Content = "";
+            message.Components = menu.BuildCurrentPage();
+        });
+    }
+
+    /// <summary>Replaces the menu message with a plain result.</summary>
+    private async Task CloseAsync(string content)
+    {
+        await ModifyOriginalResponseAsync(message =>
+        {
+            message.Content = content;
+            message.Components = EmptyComponents;
+        });
     }
 }

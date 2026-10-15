@@ -1,143 +1,158 @@
-﻿using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
 using CloudMusicBot.Modules.Modals;
 using Discord;
 using Discord.Interactions;
-using Newtonsoft.Json.Linq;
 
 namespace CloudMusicBot.Modules;
 
 [Group("login", "登录网易云账号")]
-public class LoginCommandModule : InteractionModuleBase<SocketInteractionContext>
+public class LoginCommandModule : BotModule
 {
-    private static readonly HttpClient HttpClient = new HttpClient();
-    private static readonly Dictionary<ulong, string> QrKey = new Dictionary<ulong, string>();
-    
+    private static readonly TimeSpan QrLifetime = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan QrPollInterval = TimeSpan.FromSeconds(2);
+
+    /// <summary>Pending qr keys, so asking again shows the same code instead of a new one.</summary>
+    private static readonly ConcurrentDictionary<ulong, string> QrKeys = new();
+
+    public LoginCommandModule(Bot bot) : base(bot)
+    {
+    }
+
+    [SlashCommand("logout", "退出网易云账号登录")]
+    public async Task LogoutAsync()
+    {
+        await DeferAsync(ephemeral: true);
+        Bot.Sessions.Remove(Context.User.Id);
+        await FollowupAsync("**✔成功退出登录**");
+    }
+
     [SlashCommand("qr", "二维码登录")]
     public async Task LoginQrAsync()
     {
         await DeferAsync(ephemeral: true);
-        if (!QrKey.TryGetValue(Context.User.Id, out var key))
+
+        string key;
+        try
         {
-            var keyResponse = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/login/qr/key");
-            JObject json = JObject.Parse(await keyResponse.Content.ReadAsStringAsync());
-            if ((int) json["code"] == 200)
-            {
-                key = (string) json["data"]["unikey"];
-                QrKey[Context.User.Id] = key;
-            }
-            else
-            {
-                await FollowupAsync($"**❌创建二维码失败，请稍后重试！**");
-                return;
-            }
+            key = QrKeys.TryGetValue(Context.User.Id, out var pending)
+                ? pending
+                : QrKeys[Context.User.Id] = await Api.CreateQrKeyAsync();
         }
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/login/qr/create?key={key}&qrimg=true");
-        var data = JObject.Parse(await response.Content.ReadAsStringAsync());
-        if ((int) data["code"] == 200)
+        catch (BotApiException e)
         {
-            string base64 = ((string)data["data"]["qrimg"]).Split(",", 2)[1];
-            byte[] b = Convert.FromBase64String(base64);
-            var ms = new MemoryStream(b);
-            await FollowupWithFileAsync(ms, "qr.png", "**↓请扫描下方二维码登录↓**", ephemeral: true);
-            await ms.DisposeAsync();
-            _ = QrLoginTask(Context.User.Id);
+            await FollowupAsync($"**❌{e.Message}**");
+            return;
         }
-        else
+
+        byte[] image;
+        try
         {
-            await FollowupAsync($"**❌创建二维码失败，请稍后重试！**");
+            image = await Api.CreateQrImageAsync(key);
         }
+        catch (BotApiException e)
+        {
+            await FollowupAsync($"**❌{e.Message}**");
+            return;
+        }
+
+        await ModifyOriginalResponseAsync(message =>
+        {
+            message.Content = "**↓请扫描下方二维码登录↓**";
+            message.Attachments = new[] { new FileAttachment(new MemoryStream(image), "qr.png") };
+        });
+
+        _ = WatchQrLoginAsync(Context.User.Id, key);
     }
 
-    private async Task QrLoginTask(ulong uid)
-    {
-        bool scanned = false;
-        while (true)
-        {
-            var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/login/qr/check?key={QrKey[uid]}");
-            JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
-            int code = (int)data["code"];
-            
-            if (code == 800)
-            {
-                await ModifyOriginalResponseAsync(x =>
-                {
-                    x.Content = "**❌二维码已失效，请重新登录！**";
-                    x.Attachments = Array.Empty<FileAttachment>();
-                });
-                break;
-            }
-            if (code == 802 && !scanned)
-            {
-                scanned = true;
-                await ModifyOriginalResponseAsync(x =>
-                {
-                    x.Content = "**请在网易云手机客户端点击确认登录**";
-                    x.Attachments = Array.Empty<FileAttachment>();
-                });
-            } 
-            else if (code == 803)
-            {
-                if (UserCookie.TryParseCookie((string)data["cookie"], out var cookie))
-                {
-                    UserCookie.NewUserCookie(uid, cookie);
-                    
-                    response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/login/status", uid);
-                    data = JObject.Parse(await response.Content.ReadAsStringAsync());
-                    string nick = (string) data["data"]["profile"]["nickname"];
-                    ulong cloudMusicUserid = (ulong) data["data"]["account"]["id"];
-                    await ModifyOriginalResponseAsync(x =>
-                    {
-                        x.Content = $"**✔登录成功**\n用户: {nick}\nID: {cloudMusicUserid}";
-                        x.Attachments = Array.Empty<FileAttachment>();
-                    });
-                }
-                else
-                {
-                    await ModifyOriginalResponseAsync(x =>
-                    {
-                        x.Content = "**❌服务器返回了错误的数据！**";
-                        x.Attachments = Array.Empty<FileAttachment>();
-                    });
-                }
-                break;
-            }
-            
-            await Task.Delay(1000);
-        }
-        
-        QrKey.Remove(uid);
-    }
-    
     [SlashCommand("password", "密码登录")]
-    public async Task LoginPasswordAsync()
-    {
-        await RespondWithModalAsync<AccountModal>("account_modal");
-    }
-    
+    public Task LoginPasswordAsync() => RespondWithModalAsync<AccountModal>("account_modal");
+
     [SlashCommand("captcha", "验证码登录")]
-    public async Task LoginCaptchaAsync([Summary("phone", "手机号")] ulong number)
+    public async Task LoginCaptchaAsync([Summary("phone", "手机号")] string phone)
     {
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/captcha/sent?phone={number}");
-        JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
-        if ((int) data["code"] == 200)
+        try
         {
-            await RespondWithModalAsync<CaptchaModal>("captcha_modal");
-            CaptchaModule.Phone[Context.User.Id] = number;
-            for (int i = 0; i < 120; i++)
+            await Api.SendLoginCaptchaAsync(phone);
+        }
+        catch (Exception e)
+        {
+            BotLog.Warn($"验证码发送失败: {e.Message}");
+            await RespondAsync($"**❌验证码发送失败: {e.Message}**", ephemeral: true);
+            return;
+        }
+
+        await RespondWithModalAsync<CaptchaModal>("captcha_modal");
+        Bot.Captcha.Set(Context.User.Id, phone);
+    }
+
+    /// <summary>Polls the api in the background; the command handler itself returns right away.</summary>
+    private async Task WatchQrLoginAsync(ulong userId, string key)
+    {
+        using var timeout = new CancellationTokenSource(QrLifetime);
+        var scanned = false;
+
+        try
+        {
+            while (!timeout.IsCancellationRequested)
             {
-                if (!CaptchaModule.Phone.ContainsKey(Context.User.Id))
+                await Task.Delay(QrPollInterval, timeout.Token);
+
+                var result = await Api.CheckQrAsync(key, timeout.Token);
+                switch (result.Status)
                 {
-                    return;
+                    case QrLoginStatus.Expired:
+                        await UpdateQrStatusAsync("**❌二维码已失效，请重新登录！**");
+                        return;
+
+                    case QrLoginStatus.Scanned when !scanned:
+                        scanned = true;
+                        await UpdateQrStatusAsync("**请在网易云手机客户端点击确认登录**");
+                        break;
+
+                    case QrLoginStatus.Confirmed:
+                        await CompleteQrLoginAsync(userId, result.Cookie!);
+                        return;
                 }
-                await Task.Delay(5000);
             }
 
-            CaptchaModule.Phone.Remove(Context.User.Id);
+            await UpdateQrStatusAsync("**❌二维码已失效，请重新登录！**");
         }
-        else
+        catch (OperationCanceledException)
         {
-            await RespondAsync($"**❌验证码发送失败: {data["message"]}**", ephemeral: true);
+            // Timed out or the bot is shutting down.
+        }
+        catch (Exception e)
+        {
+            BotLog.Error($"二维码登录失败: {e.Message}");
+            await UpdateQrStatusAsync("**❌登录失败，请稍后重试！**");
+        }
+        finally
+        {
+            QrKeys.TryRemove(userId, out _);
+        }
+    }
+
+    private async Task CompleteQrLoginAsync(ulong userId, string cookie)
+    {
+        Bot.Sessions.Set(userId, cookie);
+        var account = await Api.GetAccountAsync(userId);
+        await UpdateQrStatusAsync(
+            $"**✔登录成功**\n用户: {account?.Nickname ?? "未知用户"}\nID: {account?.UserId ?? 0}");
+    }
+
+    private async Task UpdateQrStatusAsync(string content)
+    {
+        try
+        {
+            await ModifyOriginalResponseAsync(message =>
+            {
+                message.Content = content;
+                message.Attachments = Array.Empty<FileAttachment>();
+            });
+        }
+        catch (Exception e)
+        {
+            BotLog.Warn($"更新二维码状态失败: {e.Message}");
         }
     }
 }

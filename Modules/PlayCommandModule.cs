@@ -1,159 +1,119 @@
-﻿using System.Collections.Specialized;
-using System.Web;
+using System.Text.RegularExpressions;
 using Discord;
 using Discord.Interactions;
-using Discord.WebSocket;
-using Newtonsoft.Json.Linq;
 
 namespace CloudMusicBot.Modules;
 
 [Group("play", "播放音乐")]
-public class PlayCommandModule : InteractionModuleBase<SocketInteractionContext>
+public partial class PlayCommandModule : BotModule
 {
-    private static readonly HttpClient HttpClient = new HttpClient();
-    
+    public PlayCommandModule(Bot bot) : base(bot)
+    {
+    }
+
     [SlashCommand("search", "搜索歌曲")]
     public async Task SearchAsync([Summary("keyword", "关键字")] string keyword)
     {
         await DeferAsync(ephemeral: true);
-        if (Context.Guild == null)
+        if (!await RequireVoiceChannelAsync() || !await RequireLoginAsync() || !await RequireNoOpenMenuAsync())
         {
-            await FollowupAsync($"❌请前往 **{Program.MusicChannel.Guild.Name}** 中执行该指令！");
-            return;
-        }
-        
-        if (!UserCookie.UserCookies.ContainsKey(Context.User.Id))
-        {
-            await FollowupAsync("**❌你需要登录后才能执行该操作！**");
             return;
         }
 
-        if (Menu.TryGetUserCurrentMenu(Context.User, out _))
+        IReadOnlyList<Music> songs;
+        try
         {
-            await FollowupAsync("**❌你还有未处理的表单！**");
+            songs = await Api.SearchSongsAsync(keyword, Context.User.Id);
+        }
+        catch (BotApiException e)
+        {
+            await FollowupAsync($"**❌搜索失败: {e.Message}**");
             return;
         }
-        
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/search?limit=20&keywords={keyword}", Context.User.Id);
-        JObject data = JObject.Parse(await response.Content.ReadAsStringAsync());
-        if ((int)data["code"] == 200)
-        {
-            JArray array = (JArray)data["result"]["songs"];
 
-            if (array.Count == 0)
-            {
-                await FollowupAsync("**❌未搜索到歌曲**");
-                return;
-            }
-            
-            List<SelectMenuOptionBuilder> options = new List<SelectMenuOptionBuilder>();
-            foreach (var token in array)
-            {
-                options.Add(new SelectMenuOptionBuilder($"{token["name"]} - {MusicUtils.GetArtists(token)}", (string)token["id"], $"《{MusicUtils.GetAlbum(token, out _)}》"));
-            }
-            
-            var menu = new Menu("music", options, "搜索结果", true, Context.User);
-            await FollowupAsync(components: menu.GetCurrentPage());
+        if (songs.Count == 0)
+        {
+            await FollowupAsync("**❌未搜索到歌曲**");
+            return;
         }
+
+        var options = songs.Select(song =>
+            Menu.Option(song.Title, song.Id.ToString(), $"《{song.Album}》"));
+
+        var menu = Bot.Menus.Open(Context.User.Id, "music", "搜索结果", multiSelect: true, options);
+        await FollowupAsync(components: menu.BuildCurrentPage());
     }
 
     [SlashCommand("id", "ID点播歌曲")]
     public async Task IdAsync([Summary("id", "歌曲ID")] ulong id)
     {
         await DeferAsync(ephemeral: true);
-        
-        if (Context.Guild == null)
+        if (!await RequireVoiceChannelAsync() || !await RequireLoginAsync())
         {
-            await FollowupAsync($"❌请前往 **{Program.MusicChannel.Guild.Name}** 中执行该指令！");
             return;
         }
-        
-        if (!UserCookie.UserCookies.ContainsKey(Context.User.Id))
-        {
-            await FollowupAsync("**❌你需要登录后才能执行该操作！**");
-            return;
-        }
-        
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/song/detail?ids={id}", Context.User.Id);
-        string reply = await response.Content.ReadAsStringAsync();
-        
-        JObject data = (JObject)(((JArray)(JObject.Parse(reply)["songs"]))[0]);
-        if (!data.ContainsKey("al") && !data.ContainsKey("album"))
-        {
-            await FollowupAsync("**❌未找到对应歌曲**");
-            return;
-        }
-        
-        Music music = new Music()
-        {
-            Id = (ulong)data["id"],
-            Name = (string)data["name"],
-            Artist = MusicUtils.GetArtists(data),
-            Album = MusicUtils.GetAlbum(data, out var cover),
-            Cover = cover,
-            Owner = Context.User.Id
-        };
-        
-        AudioPlayer.PlayList.Add(music);
-        await FollowupAsync("**✔歌曲提交成功**");
-        await Program.MusicChannel.SendMessageAsync($"<@{Context.User.Id}> 点播 1 首歌曲: \n```{music.Name} - {music.Artist} 《{music.Album}》```");
+
+        await QueueSongAsync(id);
     }
-    
+
     [SlashCommand("url", "链接点播歌曲")]
     public async Task UrlAsync([Summary("url", "歌曲链接")] string url)
     {
         await DeferAsync(ephemeral: true);
+        if (!await RequireVoiceChannelAsync() || !await RequireLoginAsync())
+        {
+            return;
+        }
 
-        if (Context.Guild == null)
-        {
-            await FollowupAsync($"❌请前往 **{Program.MusicChannel.Guild.Name}** 中执行该指令！");
-            return;
-        }
-        
-        if (!UserCookie.UserCookies.ContainsKey(Context.User.Id))
-        {
-            await FollowupAsync("**❌你需要登录后才能执行该操作！**");
-            return;
-        }
-        
-        if (!Uri.TryCreate(url, UriKind.Absolute, out Uri uri))
+        if (!TryExtractSongId(url, out var id))
         {
             await FollowupAsync("**❌链接解析失败**");
             return;
         }
 
-        NameValueCollection query = HttpUtility.ParseQueryString(uri.Query);
-        string idText = query["id"];
+        await QueueSongAsync(id);
+    }
 
-        if (!ulong.TryParse(idText, out ulong id))
+    private async Task QueueSongAsync(ulong id)
+    {
+        Music? song;
+        try
         {
-            await FollowupAsync("**❌链接解析失败**");
+            song = await Api.GetSongAsync(id, Context.User.Id);
+        }
+        catch (BotApiException e)
+        {
+            await FollowupAsync($"**❌{e.Message}**");
             return;
         }
-        
-        
-        var response = await HttpClient.GetAsyncWithTimestamp($"{Program.Config.MusicApi}/song/detail?ids={id}", Context.User.Id);
-        string reply = await response.Content.ReadAsStringAsync();
-        JObject data = (JObject)((JArray)JObject.Parse(reply)["songs"])[0];
 
-        if (!data.ContainsKey("al") && !data.ContainsKey("album"))
+        if (song is null)
         {
             await FollowupAsync("**❌未找到对应歌曲**");
             return;
         }
-        
-        Music music = new Music()
-        {
-            Id = (ulong)data["id"],
-            Name = (string)data["name"],
-            Artist = MusicUtils.GetArtists(data),
-            Album = MusicUtils.GetAlbum(data, out var cover),
-            Cover = cover,
-            Owner = Context.User.Id
-        };
-        
-        AudioPlayer.PlayList.Add(music);
+
+        Bot.Player.Enqueue(song);
         await FollowupAsync("**✔歌曲提交成功**");
-        await Program.MusicChannel.SendMessageAsync($"<@{Context.User.Id}> 点播 1 首歌曲: \n```{music.Name} - {music.Artist} 《{music.Album}》```");
+        await Bot.SendToMusicChannelAsync($"<@{Context.User.Id}> 点播 1 首歌曲: \n```{song.DisplayName}```");
     }
+
+    /// <summary>
+    /// Reads the song id out of a share link. The web player keeps the query inside
+    /// the fragment (<c>music.163.com/#/song?id=…</c>), so the raw text is scanned.
+    /// </summary>
+    private static bool TryExtractSongId(string url, out ulong id)
+    {
+        id = 0;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out _))
+        {
+            return false;
+        }
+
+        var match = SongIdRegex().Match(url);
+        return match.Success && ulong.TryParse(match.Groups[1].Value, out id);
+    }
+
+    [GeneratedRegex(@"[?&#]id=(\d+)")]
+    private static partial Regex SongIdRegex();
 }

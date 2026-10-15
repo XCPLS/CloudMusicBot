@@ -3,3 +3,11 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+
+# 运行时生成的配置与凭证，不要提交
+config.json
+UserCookie.txt
+
+# IDE
+.idea/
+*.DotSettings.user
