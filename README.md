@@ -15,7 +15,7 @@ CloudMusicBot 是一个使用 C# 开发的 Discord 音乐机器人，在 Discord
 
 | 依赖 | 说明 |
 | --- | --- |
-| .NET 10 | 运行或编译本项目 |
+| .NET 10 | 从源码运行或自行发布时需要；Release 压缩包已自带运行时 |
 | ffmpeg | 转码音频，需在 PATH 中，或在配置里指定完整路径 |
 | 网易云音乐 API 服务 | 本项目只负责调用，需自行部署，例如 [NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) |
 
@@ -78,19 +78,27 @@ CloudMusicBot 是一个使用 C# 开发的 Discord 音乐机器人，在 Discord
 
 ## 部署
 
-### 方式一：源码运行
+### 方式一：下载 Release（推荐）
+
+解压 `CloudMusicBot-<版本>-win-x64.zip` 到任意目录，先运行一次 `CloudMusicBot.exe` 生成 `config.json`，
+填好配置后再次启动即可。压缩包是自包含的，不需要另外安装 .NET 运行时。
+
+### 方式二：源码运行
+
+需要 .NET 10 SDK。
 
 ```bash
 dotnet run -c Release
 ```
 
-### 方式二：发布后运行
+### 方式三：自行发布
 
 ```bash
-dotnet publish -c Release -r win-x64 --self-contained false
+dotnet publish CloudMusicBot.csproj -c Release -r win-x64 --self-contained true
 ```
 
-把 `bin/Release/net10.0/win-x64/publish/` 下的文件放到任意目录，配置好 `config.json` 后双击 `CloudMusicBot.exe` 启动。
+`bin/Release/net10.0/win-x64/publish/` 下的文件即完整运行目录。
+`libdave.dll`、`libsodium.dll` 两个原生依赖不在 NuGet 包里，需要自行放进该目录（Release 压缩包中已包含）。
 
 队列为空 5 分钟后机器人会自动退出语音频道，再次点歌时会自动重新连接。
 
