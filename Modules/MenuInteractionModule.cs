@@ -102,8 +102,11 @@ public class MenuInteractionModule : BotModule
 
             Bot.Player.EnqueueRange(songs);
             await CloseAsync("**✔歌曲提交成功**");
+
+            // The header has to come out of the same budget as the list itself.
+            var header = $"<@{Context.User.Id}> 点播 {songs.Count} 首歌曲: \n```";
             await Bot.SendToMusicChannelAsync(
-                $"<@{Context.User.Id}> 点播 {songs.Count} 首歌曲: \n```{TextFormat.SongList(songs).TrimStart('\n')}```");
+                $"{header}{TextFormat.SongList(songs, header.Length).TrimStart('\n')}```");
         }
         catch (BotApiException e)
         {

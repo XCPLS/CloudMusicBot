@@ -11,6 +11,13 @@ public static class TextFormat
     /// <summary>Discord limit for select menu labels and descriptions.</summary>
     public const int LabelLimit = 100;
 
+    /// <summary>
+    /// Room kept for the "…还有 N 首" note and for whatever the caller appends after the
+    /// list, such as a closing code fence. Without it the length check only covers the
+    /// lines themselves and the finished message can still land over the limit.
+    /// </summary>
+    private const int TailReserve = 24;
+
     /// <summary>Shortens <paramref name="value"/> so it fits <paramref name="limit"/> characters.</summary>
     public static string Clip(string value, int limit = LabelLimit)
     {
@@ -32,7 +39,7 @@ public static class TextFormat
         foreach (var music in remaining)
         {
             var line = "\n" + music.DisplayName;
-            if (builder.Length + line.Length + alreadyUsed > MessageLimit - 1)
+            if (builder.Length + line.Length + alreadyUsed > MessageLimit - 1 - TailReserve)
             {
                 break;
             }

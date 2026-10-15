@@ -16,6 +16,13 @@ public sealed class Menu
     private readonly List<SelectMenuOptionBuilder> _options;
     private readonly Dictionary<int, string[]> _selection = [];
 
+    /// <summary>
+    /// Discord.Net runs command bodies off the gateway thread, so two clicks by the same
+    /// user can land at once and one of them would otherwise read the selection while
+    /// the other is writing it.
+    /// </summary>
+    private readonly Lock _gate = new();
+
     private int _page = 1;
 
     internal Menu(
@@ -49,27 +56,52 @@ public sealed class Menu
 
     public void Previous()
     {
-        if (_page > 1)
+        lock (_gate)
         {
-            _page--;
+            if (_page > 1)
+            {
+                _page--;
+            }
         }
     }
 
     public void Next()
     {
-        if (_page < PageCount)
+        lock (_gate)
         {
-            _page++;
+            if (_page < PageCount)
+            {
+                _page++;
+            }
         }
     }
 
-    public void UpdateSelection(IReadOnlyList<string> values) => _selection[_page] = [.. values];
+    public void UpdateSelection(IReadOnlyList<string> values)
+    {
+        lock (_gate)
+        {
+            _selection[_page] = [.. values];
+        }
+    }
 
     /// <summary>Selected values across every page, in pick order.</summary>
-    public string[] GetSelected() =>
-        _selection.Values.SelectMany(values => values).Distinct().ToArray();
+    public string[] GetSelected()
+    {
+        lock (_gate)
+        {
+            return _selection.Values.SelectMany(values => values).Distinct().ToArray();
+        }
+    }
 
     public MessageComponent BuildCurrentPage()
+    {
+        lock (_gate)
+        {
+            return BuildCurrentPageCore();
+        }
+    }
+
+    private MessageComponent BuildCurrentPageCore()
     {
         var select = new SelectMenuBuilder()
             .WithCustomId(_customId)

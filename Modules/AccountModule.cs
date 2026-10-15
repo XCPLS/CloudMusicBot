@@ -17,7 +17,9 @@ public class AccountModule : BotModule
         var account = modal.Account.Trim();
         try
         {
-            var login = account.All(char.IsDigit)
+            // Only plain ascii digits are a phone number; char.IsDigit would also accept
+            // things like full width digits and send them to the wrong endpoint.
+            var login = account.All(char.IsAsciiDigit)
                 ? await Api.LoginByPhoneAsync(account, modal.Password)
                 : await Api.LoginByEmailAsync(account, modal.Password);
 

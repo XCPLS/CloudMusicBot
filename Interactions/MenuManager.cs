@@ -67,10 +67,11 @@ public sealed class MenuManager
             return;
         }
 
-        // Only drop the menu if the user has not opened a new one meanwhile.
+        // Drops the entry only if it is still the one this timer was started for: a menu
+        // opened between the check and the removal has to survive.
         if (_open.TryGetValue(userId, out var current) && ReferenceEquals(current.Menu, menu))
         {
-            _open.TryRemove(userId, out _);
+            _open.TryRemove(new KeyValuePair<ulong, Entry>(userId, current));
             expiry.Dispose();
         }
     }
