@@ -1,7 +1,10 @@
+using System.Buffers;
 using System.Diagnostics;
+using System.Net;
 using Discord;
 using Discord.Audio;
 using Discord.WebSocket;
+using Microsoft.Win32.SafeHandles;
 
 namespace CloudMusicBot.Playback;
 
@@ -23,6 +26,11 @@ public sealed class AudioPlayer : IAsyncDisposable
 
     /// <summary>Attempts per song, counting the first one; the rest are retries.</summary>
     private const int MaxAttempts = 3;
+
+    /// <summary>Smallest piece worth its own request, and the read buffer per piece.</summary>
+    private const int MinimumSegmentSize = 512 * 1024;
+
+    private const int SegmentBufferSize = 128 * 1024;
 
     private readonly Bot _bot;
     private readonly MusicApi _api;
@@ -298,16 +306,38 @@ public sealed class AudioPlayer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Downloads the song to a temp file, in parallel pieces when the config allows it
+    /// and the server supports ranged requests.
+    /// </summary>
     private async Task<string> DownloadOnceAsync(string streamUrl, CancellationToken ct)
     {
-        using var response = await _api.OpenStreamAsync(streamUrl, ct);
-        var path = BuildAudioPath(response, streamUrl);
+        var threads = ResolveDownloadThreads();
+        string? path = null;
         try
         {
-            await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1 << 16))
-            await using (var source = await response.Content.ReadAsStreamAsync(ct))
+            // A one byte range doubles as the probe: 206 means ranges work and tells us
+            // the total size, 200 means the server ignored it and sent the whole body.
+            using var response = await _api.OpenStreamAsync(
+                streamUrl,
+                threads > 1 ? 0 : null,
+                threads > 1 ? 0 : null,
+                ct);
+
+            path = BuildAudioPath(response, streamUrl);
+
+            long expected;
+            if (threads > 1 && response.StatusCode == HttpStatusCode.PartialContent)
             {
-                await source.CopyToAsync(file, ct);
+                expected = await DownloadSegmentsAsync(response, streamUrl, path, threads, ct);
+            }
+            else if (response.IsSuccessStatusCode)
+            {
+                expected = await CopyResponseAsync(response, path, ct);
+            }
+            else
+            {
+                throw new IOException($"音频下载失败({(int)response.StatusCode})");
             }
 
             var actual = new FileInfo(path).Length;
@@ -317,7 +347,7 @@ public sealed class AudioPlayer : IAsyncDisposable
             }
 
             // A truncated body plays as a song that ends early, so treat it as a failure.
-            if (response.Content.Headers.ContentLength is > 0 and var expected && actual < expected)
+            if (expected > 0 && actual < expected)
             {
                 throw new IOException($"音频下载不完整({actual}/{expected})");
             }
@@ -328,6 +358,114 @@ public sealed class AudioPlayer : IAsyncDisposable
         {
             DeleteAudioFile(path);
             throw;
+        }
+    }
+
+    private int ResolveDownloadThreads() =>
+        _bot.Config.ParallelDownload
+            ? Math.Clamp(_bot.Config.DownloadThreads, 1, AppConfig.MaxDownloadThreads)
+            : 1;
+
+    private static async Task<long> CopyResponseAsync(HttpResponseMessage response, string path, CancellationToken ct)
+    {
+        await using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1 << 16);
+        await using var source = await response.Content.ReadAsStreamAsync(ct);
+        await source.CopyToAsync(file, ct);
+        return response.Content.Headers.ContentLength ?? -1;
+    }
+
+    /// <summary>Fetches everything the probe did not already give us, spread over the threads.</summary>
+    private async Task<long> DownloadSegmentsAsync(HttpResponseMessage probe, string streamUrl, string path, int threads, CancellationToken ct)
+    {
+        var range = probe.Content.Headers.ContentRange;
+        if (range?.From is null || range.To is null || range.Length is not > 0)
+        {
+            // No usable size, so the probe body is not enough on its own.
+            using var whole = await _api.OpenStreamAsync(streamUrl, ct: ct);
+            return whole.IsSuccessStatusCode
+                ? await CopyResponseAsync(whole, path, ct)
+                : throw new IOException($"音频下载失败({(int)whole.StatusCode})");
+        }
+
+        var total = range.Length.Value;
+        await using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, FileOptions.Asynchronous);
+        file.SetLength(total);
+
+        // Writing through the handle instead of the stream keeps the pieces independent
+        // of one another; a shared file position would interleave them.
+        var handle = file.SafeFileHandle;
+        long offset;
+        await using (var source = await probe.Content.ReadAsStreamAsync(ct))
+        {
+            offset = await CopyToFileAsync(source, handle, 0, ct);
+        }
+
+        var remaining = total - offset;
+        if (remaining > 0)
+        {
+            // One piece per thread, but never a piece too small to be worth a connection.
+            var workers = (int)Math.Clamp(remaining / MinimumSegmentSize, 1, threads);
+            var chunk = remaining / workers;
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var pieces = new List<Task>(workers);
+            var from = offset;
+            for (var index = 0; index < workers; index++)
+            {
+                var to = index == workers - 1 ? total : from + chunk;
+                pieces.Add(FetchSegmentAsync(streamUrl, handle, from, to, linked, ct));
+                from = to;
+            }
+
+            await Task.WhenAll(pieces);
+        }
+
+        return total;
+    }
+
+    private async Task FetchSegmentAsync(string streamUrl, SafeFileHandle handle, long from, long to, CancellationTokenSource linked, CancellationToken ct)
+    {
+        try
+        {
+            using var response = await _api.OpenStreamAsync(streamUrl, from, to - 1, ct);
+            if (response.StatusCode != HttpStatusCode.PartialContent)
+            {
+                throw new IOException($"音频分片下载失败({(int)response.StatusCode})");
+            }
+
+            await using var source = await response.Content.ReadAsStreamAsync(ct);
+            var written = await CopyToFileAsync(source, handle, from, ct);
+            if (written != to - from)
+            {
+                throw new IOException($"音频分片不完整({written}/{to - from})");
+            }
+        }
+        catch
+        {
+            // Stop the sibling pieces; the song is retried from scratch anyway.
+            await linked.CancelAsync();
+            throw;
+        }
+    }
+
+    private static async Task<long> CopyToFileAsync(Stream source, SafeFileHandle handle, long offset, CancellationToken ct)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(SegmentBufferSize);
+        try
+        {
+            long written = 0;
+            int read;
+            while ((read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct)) > 0)
+            {
+                await RandomAccess.WriteAsync(handle, buffer.AsMemory(0, read), offset + written, ct);
+                written += read;
+            }
+
+            return written;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 

@@ -6,6 +6,10 @@ namespace CloudMusicBot.Configuration;
 /// <summary>Contents of <c>config.json</c>.</summary>
 public sealed class AppConfig
 {
+    /// <summary>Upper bound for <see cref="DownloadThreads"/>; the CDN is not ours to hammer.</summary>
+    public const int MaxDownloadThreads = 8;
+
+
     public ulong GuildId { get; set; }
 
     public ulong ChannelId { get; set; }
@@ -16,6 +20,12 @@ public sealed class AppConfig
 
     /// <summary>ffmpeg executable, either a command on PATH or an absolute path.</summary>
     public string FfmpegPath { get; set; } = "ffmpeg";
+
+    /// <summary>Fetch songs with parallel ranged requests instead of one sequential request.</summary>
+    public bool ParallelDownload { get; set; } = true;
+
+    /// <summary>How many requests a song download is split across.</summary>
+    public int DownloadThreads { get; set; } = 4;
 
     public bool TryValidate(out string error)
     {
@@ -88,6 +98,7 @@ public static class ConfigStore
 
         config.MusicApi = config.MusicApi.TrimEnd('/');
         config.FfmpegPath = string.IsNullOrWhiteSpace(config.FfmpegPath) ? "ffmpeg" : config.FfmpegPath.Trim();
+        config.DownloadThreads = Math.Clamp(config.DownloadThreads, 1, AppConfig.MaxDownloadThreads);
         return config;
     }
 

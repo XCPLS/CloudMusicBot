@@ -1,3 +1,4 @@
+using System.Net.Http.Headers;
 using System.Text;
 using Newtonsoft.Json.Linq;
 
@@ -116,8 +117,29 @@ public sealed class MusicApi : IDisposable
         throw new BotApiException(await ReadUnplayableReasonAsync(songId, userId, ct));
     }
 
-    public Task<HttpResponseMessage> OpenStreamAsync(string url, CancellationToken ct = default) =>
-        _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+    /// <summary>
+    /// Opens an audio url. Passing <paramref name="from"/> asks for a byte range, which
+    /// the caller uses to fetch a song in parallel pieces.
+    /// </summary>
+    public async Task<HttpResponseMessage> OpenStreamAsync(string url, long? from = null, long? to = null, CancellationToken ct = default)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        if (from is not null)
+        {
+            request.Headers.Range = new RangeHeaderValue(from, to);
+        }
+
+        try
+        {
+            // The response owns the request from here on and disposes it.
+            return await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        }
+        catch
+        {
+            request.Dispose();
+            throw;
+        }
+    }
 
     public async Task<LoginResult> LoginByPhoneAsync(string phone, string password, CancellationToken ct = default)
     {

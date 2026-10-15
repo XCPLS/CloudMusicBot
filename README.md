@@ -2,7 +2,7 @@
 
 CloudMusicBot 是一个使用 C# 开发的 Discord 音乐机器人，在 Discord 语音房中播放网易云音乐。
 
-歌曲先完整下载到本地临时文件，再由 ffmpeg 转码推流到语音频道；点歌、歌单、登录状态都通过斜杠命令和交互式表单完成。
+歌曲先分段并发下载到本地临时文件，再由 ffmpeg 转码推流到语音频道；点歌、歌单、登录状态都通过斜杠命令和交互式表单完成。
 
 ## 功能介绍
 
@@ -29,7 +29,9 @@ CloudMusicBot 是一个使用 C# 开发的 Discord 音乐机器人，在 Discord
   "ChannelId": 123456789012345678,
   "BotToken": "your-bot-token",
   "MusicApi": "http://localhost:3000",
-  "FfmpegPath": "ffmpeg"
+  "FfmpegPath": "ffmpeg",
+  "ParallelDownload": true,
+  "DownloadThreads": 4
 }
 ```
 
@@ -40,8 +42,14 @@ CloudMusicBot 是一个使用 C# 开发的 Discord 音乐机器人，在 Discord
 | `BotToken` | 在 https://discord.com/developers/applications 创建的机器人 Token |
 | `MusicApi` | 网易云音乐 API 服务地址，末尾不要带 `/` |
 | `FfmpegPath` | ffmpeg 可执行文件路径，已加入 PATH 时保持 `ffmpeg` 即可 |
+| `ParallelDownload` | 是否多线程分段下载歌曲，默认 `true` |
+| `DownloadThreads` | 分段下载的并发数，默认 `4`，取值 1-8 |
 
 > 机器人只需要服务器和语音状态权限，不需要开启 Message Content、Server Members 等特权 intent。
+
+下载相关说明：`ParallelDownload` 打开时，机器人会先用一个 1 字节的 Range 请求探测服务端是否支持分段，
+支持就按 `DownloadThreads` 拆成多段并发拉取、再按偏移写入同一个文件；服务端忽略 Range、返回完整响应时
+自动退回单线程，不会多花一次请求。缓存服务端不支持断点续传时会自动退化为原来的单线程下载。
 
 ### 运行前检查
 
