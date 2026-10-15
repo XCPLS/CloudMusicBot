@@ -20,6 +20,13 @@ public sealed class AudioPlayer : IAsyncDisposable
     private static readonly TimeSpan FfmpegArgumentWait = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan VoiceConnectTimeout = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// Longest a download may go without receiving a byte. The audio host is not ours
+    /// and a connection that goes quiet must become a failed song instead of a player
+    /// that sits there believing it is still playing.
+    /// </summary>
+    private static readonly TimeSpan DownloadStallTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan VoiceDisconnectTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan StreamWatchInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan StatusUpdateTimeout = TimeSpan.FromSeconds(10);
@@ -125,6 +132,10 @@ public sealed class AudioPlayer : IAsyncDisposable
         _exitRequested = true;
         Skip();
         Signal();
+
+        // Without a running worker to consume the flag it would survive until the next
+        // song is queued and then silently drop it.
+        EnsureWorker();
     }
 
     public async ValueTask DisposeAsync()
@@ -220,11 +231,21 @@ public sealed class AudioPlayer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Waits for the next song, giving up after <see cref="IdleDisconnectDelay"/> when
+    /// there is still a channel to leave. Only when the bot is connected to nothing at
+    /// all does it wait forever, because then there is nothing to time out for.
+    /// </summary>
     private async Task<bool> WaitForWorkAsync(CancellationToken ct)
     {
-        var timeout = _voice is null ? Timeout.InfiniteTimeSpan : IdleDisconnectDelay;
+        var timeout = _voice is null && !IsInVoiceChannel() ? Timeout.InfiniteTimeSpan : IdleDisconnectDelay;
         return await _wakeup.WaitAsync(timeout, ct);
     }
+
+    /// <summary>Whether the gateway still has the bot sitting in the music voice channel.</summary>
+    private bool IsInVoiceChannel() =>
+        _bot.VoiceChannel is { } channel &&
+        channel.Guild.GetUser(_bot.Client.CurrentUser.Id)?.VoiceChannel?.Id == channel.Id;
 
     private bool TryDequeue(out Music? music)
     {
@@ -314,6 +335,14 @@ public sealed class AudioPlayer : IAsyncDisposable
     {
         var threads = ResolveDownloadThreads();
         string? path = null;
+
+        // Every read pushes the deadline out again, so only a connection that actually
+        // stops delivering data trips it. Without this the http client waits forever
+        // (its own timeout is infinite) and the playback worker never returns to the
+        // queue, which also means the idle disconnect never gets a chance to fire.
+        using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        stall.CancelAfter(DownloadStallTimeout);
+
         try
         {
             // A one byte range doubles as the probe: 206 means ranges work and tells us
@@ -322,18 +351,19 @@ public sealed class AudioPlayer : IAsyncDisposable
                 streamUrl,
                 threads > 1 ? 0 : null,
                 threads > 1 ? 0 : null,
-                ct);
+                stall.Token);
 
             path = BuildAudioPath(response, streamUrl);
+            stall.CancelAfter(DownloadStallTimeout);
 
             long expected;
             if (threads > 1 && response.StatusCode == HttpStatusCode.PartialContent)
             {
-                expected = await DownloadSegmentsAsync(response, streamUrl, path, threads, ct);
+                expected = await DownloadSegmentsAsync(response, streamUrl, path, threads, stall, ct);
             }
             else if (response.IsSuccessStatusCode)
             {
-                expected = await CopyResponseAsync(response, path, ct);
+                expected = await CopyResponseAsync(response, path, stall, ct);
             }
             else
             {
@@ -354,6 +384,12 @@ public sealed class AudioPlayer : IAsyncDisposable
 
             return path;
         }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The stall deadline, not the user: worth another attempt.
+            DeleteAudioFile(path);
+            throw new IOException("音频下载超时");
+        }
         catch
         {
             DeleteAudioFile(path);
@@ -366,24 +402,39 @@ public sealed class AudioPlayer : IAsyncDisposable
             ? Math.Clamp(_bot.Config.DownloadThreads, 1, AppConfig.MaxDownloadThreads)
             : 1;
 
-    private static async Task<long> CopyResponseAsync(HttpResponseMessage response, string path, CancellationToken ct)
+    private static async Task<long> CopyResponseAsync(HttpResponseMessage response, string path, CancellationTokenSource stall, CancellationToken ct)
     {
         await using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1 << 16);
         await using var source = await response.Content.ReadAsStreamAsync(ct);
-        await source.CopyToAsync(file, ct);
+
+        var buffer = ArrayPool<byte>.Shared.Rent(SegmentBufferSize);
+        try
+        {
+            int read;
+            while ((read = await source.ReadAsync(buffer, stall.Token)) > 0)
+            {
+                await file.WriteAsync(buffer.AsMemory(0, read), ct);
+                stall.CancelAfter(DownloadStallTimeout);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
         return response.Content.Headers.ContentLength ?? -1;
     }
 
     /// <summary>Fetches everything the probe did not already give us, spread over the threads.</summary>
-    private async Task<long> DownloadSegmentsAsync(HttpResponseMessage probe, string streamUrl, string path, int threads, CancellationToken ct)
+    private async Task<long> DownloadSegmentsAsync(HttpResponseMessage probe, string streamUrl, string path, int threads, CancellationTokenSource stall, CancellationToken ct)
     {
         var range = probe.Content.Headers.ContentRange;
         if (range?.From is null || range.To is null || range.Length is not > 0)
         {
             // No usable size, so the probe body is not enough on its own.
-            using var whole = await _api.OpenStreamAsync(streamUrl, ct: ct);
+            using var whole = await _api.OpenStreamAsync(streamUrl, ct: stall.Token);
             return whole.IsSuccessStatusCode
-                ? await CopyResponseAsync(whole, path, ct)
+                ? await CopyResponseAsync(whole, path, stall, ct)
                 : throw new IOException($"音频下载失败({(int)whole.StatusCode})");
         }
 
@@ -397,7 +448,7 @@ public sealed class AudioPlayer : IAsyncDisposable
         long offset;
         await using (var source = await probe.Content.ReadAsStreamAsync(ct))
         {
-            offset = await CopyToFileAsync(source, handle, 0, ct);
+            offset = await CopyToFileAsync(source, handle, 0, stall, ct);
         }
 
         var remaining = total - offset;
@@ -413,7 +464,7 @@ public sealed class AudioPlayer : IAsyncDisposable
             for (var index = 0; index < workers; index++)
             {
                 var to = index == workers - 1 ? total : from + chunk;
-                pieces.Add(FetchSegmentAsync(streamUrl, handle, from, to, linked, ct));
+                pieces.Add(FetchSegmentAsync(streamUrl, handle, from, to, linked, stall, ct));
                 from = to;
             }
 
@@ -423,18 +474,18 @@ public sealed class AudioPlayer : IAsyncDisposable
         return total;
     }
 
-    private async Task FetchSegmentAsync(string streamUrl, SafeFileHandle handle, long from, long to, CancellationTokenSource linked, CancellationToken ct)
+    private async Task FetchSegmentAsync(string streamUrl, SafeFileHandle handle, long from, long to, CancellationTokenSource linked, CancellationTokenSource stall, CancellationToken ct)
     {
         try
         {
-            using var response = await _api.OpenStreamAsync(streamUrl, from, to - 1, ct);
+            using var response = await _api.OpenStreamAsync(streamUrl, from, to - 1, stall.Token);
             if (response.StatusCode != HttpStatusCode.PartialContent)
             {
                 throw new IOException($"音频分片下载失败({(int)response.StatusCode})");
             }
 
             await using var source = await response.Content.ReadAsStreamAsync(ct);
-            var written = await CopyToFileAsync(source, handle, from, ct);
+            var written = await CopyToFileAsync(source, handle, from, stall, ct);
             if (written != to - from)
             {
                 throw new IOException($"音频分片不完整({written}/{to - from})");
@@ -448,17 +499,18 @@ public sealed class AudioPlayer : IAsyncDisposable
         }
     }
 
-    private static async Task<long> CopyToFileAsync(Stream source, SafeFileHandle handle, long offset, CancellationToken ct)
+    private static async Task<long> CopyToFileAsync(Stream source, SafeFileHandle handle, long offset, CancellationTokenSource stall, CancellationToken ct)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(SegmentBufferSize);
         try
         {
             long written = 0;
             int read;
-            while ((read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct)) > 0)
+            while ((read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), stall.Token)) > 0)
             {
                 await RandomAccess.WriteAsync(handle, buffer.AsMemory(0, read), offset + written, ct);
                 written += read;
+                stall.CancelAfter(DownloadStallTimeout);
             }
 
             return written;
@@ -528,7 +580,7 @@ public sealed class AudioPlayer : IAsyncDisposable
             {
                 BotLog.Warn($"播放中断({e.Message})，{RetryDelay.TotalSeconds:0} 秒后重连，" +
                             $"第 {attempt}/{MaxAttempts - 1} 次");
-                await DisconnectVoiceAsync();
+                await DisconnectVoiceAsync(reconnecting: true);
                 await Task.Delay(RetryDelay, ct);
             }
         }
@@ -660,7 +712,7 @@ public sealed class AudioPlayer : IAsyncDisposable
             return connected;
         }
 
-        await DisconnectVoiceAsync();
+        await DisconnectVoiceAsync(reconnecting: true);
 
         using var timeout = new CancellationTokenSource(VoiceConnectTimeout);
         var voice = await channel.ConnectAsync().WaitAsync(timeout.Token);
@@ -683,7 +735,11 @@ public sealed class AudioPlayer : IAsyncDisposable
         return Task.CompletedTask;
     }
 
-    private async Task DisconnectVoiceAsync()
+    /// <summary>
+    /// Leaves the voice channel. <paramref name="reconnecting"/> marks the calls that
+    /// connect again straight after, which must leave the channel status alone.
+    /// </summary>
+    private async Task DisconnectVoiceAsync(bool reconnecting = false)
     {
         IAudioClient? voice;
         lock (_gate)
@@ -696,7 +752,21 @@ public sealed class AudioPlayer : IAsyncDisposable
 
         if (voice is null)
         {
+            // No audio client, but the gateway may still have the bot sitting in the
+            // channel; that state is only undone through the channel itself.
+            if (!reconnecting)
+            {
+                await LeaveChannelAsync();
+            }
+
             return;
+        }
+
+        // Cleared before leaving: out of the channel the bot may not edit it any more,
+        // and a status set afterwards never lands.
+        if (!reconnecting)
+        {
+            RequestChannelStatus(DefaultChannelStatus);
         }
 
         try
@@ -715,8 +785,25 @@ public sealed class AudioPlayer : IAsyncDisposable
         {
             voice.Dispose();
         }
+    }
 
-        RequestChannelStatus(DefaultChannelStatus);
+    /// <summary>Leaves the music channel through the gateway, for when no audio client is left.</summary>
+    private async Task LeaveChannelAsync()
+    {
+        if (_bot.VoiceChannel is not { } channel || !IsInVoiceChannel())
+        {
+            return;
+        }
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(VoiceDisconnectTimeout);
+            await channel.DisconnectAsync().WaitAsync(timeout.Token);
+        }
+        catch (Exception e)
+        {
+            BotLog.Warn($"退出语音频道失败: {e.Message}");
+        }
     }
 
     /// <summary>
